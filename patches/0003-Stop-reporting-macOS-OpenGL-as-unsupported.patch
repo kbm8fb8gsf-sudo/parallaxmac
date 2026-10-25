@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 17:43:44 +0000
+Subject: [PATCH 3/4] Stop reporting macOS OpenGL as unsupported
+
+With the CPU scatter backend, a missing compute shader or async readback
+support is no longer fatal, so log which backend is in use instead of showing
+the critical "not supported on MacOSX systems running OpenGL" popup.
+
+The wireframe debug shader uses a geometry shader, which Metal doesn't have;
+report that as an error rather than a critical popup since it is only a debug
+view.
+---
+ Mod Source/Parallax/AssetBundleLoader.cs      | 15 ++++++++++++---
+ .../Parallax/Debugging/ParallaxSystemInfo.cs  | 19 +++++++------------
+ 2 files changed, 19 insertions(+), 15 deletions(-)
+
+diff --git a/Mod Source/Parallax/AssetBundleLoader.cs b/Mod Source/Parallax/AssetBundleLoader.cs
+index f4e903e..7852d9c 100644
+--- a/Mod Source/Parallax/AssetBundleLoader.cs	
++++ b/Mod Source/Parallax/AssetBundleLoader.cs	
+@@ -1,4 +1,4 @@
+-using System;
++﻿using System;
+ using System.Collections.Generic;
+ using System.IO;
+ using System.Linq;
+@@ -102,11 +102,20 @@ namespace Parallax
+                         Shader s = shader as Shader;
+                         if (s != null && !s.isSupported)
+                         {
+-                            ParallaxDebug.LogCritical("Shader has no usable variant on this API: " + s.name);
++                            // The wireframe debug view uses a geometry shader, which Metal doesn't have. Not needed to play
++                            if (s.name == "Custom/Wireframe")
++                            {
++                                ParallaxDebug.LogError("Shader has no usable variant on this API, the wireframe debug view is unavailable: " + s.name);
++                            }
++                            else
++                            {
++                                ParallaxDebug.LogCritical("Shader has no usable variant on this API: " + s.name);
++                            }
+                         }
+                         else if (shader is ComputeShader && !SystemInfo.supportsComputeShaders)
+                         {
+-                            ParallaxDebug.LogCritical("Compute shaders unsupported on this device: " + shader.name);
++                            // Expected on macOS OpenGL - the CPU scatter backend replaces this compute shader
++                            ParallaxDebug.Log("Compute shaders unsupported on this device, using the CPU scatter backend instead of: " + shader.name);
+                         }
+ 
+                         dest.Add(shader.name, shader);
+diff --git a/Mod Source/Parallax/Debugging/ParallaxSystemInfo.cs b/Mod Source/Parallax/Debugging/ParallaxSystemInfo.cs
+index d76e0a4..6c721b3 100644
+--- a/Mod Source/Parallax/Debugging/ParallaxSystemInfo.cs	
++++ b/Mod Source/Parallax/Debugging/ParallaxSystemInfo.cs	
+@@ -35,21 +35,16 @@ namespace Parallax.Debugging
+             ParallaxDebug.Log("Available VRAM: " + availableVRAM);
+             ParallaxDebug.Log("Available RAM: " + availableRAM);
+ 
+-            if (!supportsComputeShaders || !supportsAsyncReadback)
++            // Without compute shaders (macOS OpenGL 4.1) scatters are generated on the CPU instead, see CpuScatterSystem
++            CpuScatterSystem.LogStatus();
++            if (!supportsComputeShaders && !SystemInfo.supportsInstancing)
+             {
+-                ParallaxDebug.LogError("This system is not capable of running Parallax.");
+-                if (!supportsComputeShaders)
+-                {
+-                    ParallaxDebug.LogError(" - Reason: This system does not support compute shaders");
+-                }
+-                else
+-                {
+-                    ParallaxDebug.LogError(" - Reason: This system does not support async GPU readback");
+-                }
++                ParallaxDebug.LogError("This system is not capable of rendering Parallax scatters.");
++                ParallaxDebug.LogError(" - Reason: This system supports neither compute shaders nor GPU instancing");
+             }
+-            if (SystemInfo.graphicsDeviceVersion.StartsWith("OpenGL") && Application.platform == RuntimePlatform.OSXPlayer)
++            else if (supportsComputeShaders && !supportsAsyncReadback)
+             {
+-                ParallaxDebug.LogCritical("Parallax is not supported on MacOSX systems running OpenGL. Please install CrossOver and under 'Advanced Settings', set 'Graphics' to 'D3DMetal' with synchronization 'MSync'");
++                ParallaxDebug.Log("This system does not support async GPU readback - scatter colliders will be read back synchronously");
+             }
+         }
+     }

@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 17:43:44 +0000
+Subject: [PATCH 4/4] Declare _WorldSpaceReferencePosition as float3
+
+It is set with SetVector and used as a position by the
+SEPARATE_LOD_RANGE_CULLING Evaluate kernels (scatters culled around the craft
+rather than the camera), but was declared as a float, so only its x
+component reached the shader.
+---
+ Assets/Shaders/Scatters/ScatterParams.cginc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Assets/Shaders/Scatters/ScatterParams.cginc b/Assets/Shaders/Scatters/ScatterParams.cginc
+index a4d1d58..bb4dd0e 100644
+--- a/Assets/Shaders/Scatters/ScatterParams.cginc
++++ b/Assets/Shaders/Scatters/ScatterParams.cginc
+@@ -75,7 +75,7 @@ float _CullLimit;
+ // Range before cutting off entirely
+ float _MaxRange;
+ 
+-float _WorldSpaceReferencePosition;
++float3 _WorldSpaceReferencePosition;
+ 
+ // Range before scatters begin to cut off
+ float _RangeFadeStart;

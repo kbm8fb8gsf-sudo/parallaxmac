@@ -1,0 +1,2055 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 17:43:44 +0000
+Subject: [PATCH 1/4] Add a CPU scatter backend for graphics APIs without
+ compute shaders
+
+KSP on macOS renders with OpenGL 4.1, which has no compute shaders or
+structured buffers, so the scatter system could not run there.
+
+When SystemInfo.supportsComputeShaders is false, the Distribute and Evaluate
+kernels of TerrainScatters.compute now run as Burst jobs:
+
+- CpuScatterMath ports the kernel helpers and the three noise functions from
+  gpu_noise_lib.glsl.
+- CpuDistributeJob runs once per scatter per quad, like the Distribute kernel.
+  Everything the Evaluate kernel derives per object that does not change frame
+  to frame (orientation, random rotation, scale, terrain colour, despawn roll)
+  is precomputed here.
+- CpuEvaluateJob runs every frame per visible quad, frustum and range culls,
+  and sorts the objects into LODs.
+- The biome and block maps are read from their MapSO data, since KSP and
+  Kopernicus compile them to unreadable textures.
+- Each renderer uploads its LODs into RGBAFloat textures (4 texels per
+  instance) and draws them with Graphics.DrawMeshInstancedProcedural, capped
+  at the same counts as the GPU path's append buffers.
+- Colliders get their positions straight from the distribute job instead of
+  an async readback.
+
+The GPU path is unchanged when compute shaders are available.
+---
+ Mod Source/Parallax/PQS Mods/ScatterData.cs   | 312 ++++++++++++++
+ .../PQS Mods/ScatterSystemQuadData.cs         |  86 +++-
+ .../Scatter System/CPU/CpuScatterJobs.cs      | 408 ++++++++++++++++++
+ .../Scatter System/CPU/CpuScatterMath.cs      | 385 +++++++++++++++++
+ .../Scatter System/CPU/CpuScatterSystem.cs    | 366 ++++++++++++++++
+ .../Parallax/Scatter System/ScatterManager.cs |  62 ++-
+ .../Scatter System/ScatterRenderer.cs         | 170 ++++++--
+ 7 files changed, 1730 insertions(+), 59 deletions(-)
+ create mode 100644 Mod Source/Parallax/Scatter System/CPU/CpuScatterJobs.cs
+ create mode 100644 Mod Source/Parallax/Scatter System/CPU/CpuScatterMath.cs
+ create mode 100644 Mod Source/Parallax/Scatter System/CPU/CpuScatterSystem.cs
+
+diff --git a/Mod Source/Parallax/PQS Mods/ScatterData.cs b/Mod Source/Parallax/PQS Mods/ScatterData.cs
+index ab2335c..097c287 100644
+--- a/Mod Source/Parallax/PQS Mods/ScatterData.cs	
++++ b/Mod Source/Parallax/PQS Mods/ScatterData.cs	
+@@ -1,6 +1,8 @@
+ ﻿using UnityEngine.Rendering;
+ using UnityEngine;
+ using Unity.Collections;
++using Unity.Jobs;
++using Unity.Mathematics;
+ 
+ namespace Parallax
+ {
+@@ -46,6 +48,18 @@ namespace Parallax
+         bool collidersAdded = false;
+         public bool cleaned = false;
+ 
++        // CPU backend (no compute shader support) - see CpuScatterSystem
++        JobHandle cpuDistributeHandle;
++        JobHandle cpuEvaluateHandle;
++        bool cpuDistributing = false;
++        bool cpuEvaluating = false;
++        NativeList<PositionData> cpuPositions;
++        NativeList<CpuScatterInstance> cpuInstances;
++        NativeArray<CpuScatterInstance> cpuInstanceData;
++        NativeList<CpuScatterInstanceRows> cpuOutputLOD0;
++        NativeList<CpuScatterInstanceRows> cpuOutputLOD1;
++        NativeList<CpuScatterInstanceRows> cpuOutputLOD2;
++
+         public ScatterData(ScatterSystemQuadData parent, Scatter scatter)
+         {
+             this.parent = parent;
+@@ -54,6 +68,11 @@ namespace Parallax
+         public void Start()
+         {
+             Initialize();
++            if (CpuScatterSystem.Enabled)
++            {
++                CpuDistribute();
++                return;
++            }
+             InitializeDistribute();
+             Distribute();
+         }
+@@ -443,6 +462,12 @@ namespace Parallax
+             // Not finished distributing yet
+             if (!eventAdded) { return; }
+ 
++            if (CpuScatterSystem.Enabled)
++            {
++                CpuEvaluate();
++                return;
++            }
++
+             // Point the scatter's compute shader buffers to this quad's
+             scatterShader.SetBuffer(evaluateKernel, ParallaxScatterShaderProperties.parentTrisBufferID, parent.sourceTrianglesBuffer);
+             scatterShader.SetBuffer(evaluateKernel, ParallaxScatterShaderProperties.parentVertsBufferID, parent.sourceVertsBuffer);
+@@ -529,6 +554,7 @@ namespace Parallax
+                 outputScatterDataBuffer?.Dispose();
+                 dispatchArgs?.Dispose();
+                 objectLimits?.Dispose();
++                CpuRelease();
+ 
+                 paused = true;
+                 cleaned = true;
+@@ -573,6 +599,292 @@ namespace Parallax
+             outputScatterDataBuffer?.Dispose();
+             dispatchArgs?.Dispose();
+             objectLimits?.Dispose();
++            CpuRelease();
++        }
++
++        //
++        //  CPU backend
++        //  Mirrors Distribute -> OnDistributeComplete -> Evaluate above, using the Burst jobs in CpuScatterJobs.cs
++        //
++
++        /// <summary>
++        /// Schedule the distribution job. The result is processed by CpuScatterSystem.PollDistributions once the job is done,
++        /// like the GPU path's async readback.
++        /// </summary>
++        void CpuDistribute()
++        {
++            count[0] = 0;
++            realCount = 0;
++
++            // Grows as needed, and is compacted once the job is done
++            int initialCapacity = Mathf.Clamp(outputSize, 1, 1024);
++            cpuPositions = new NativeList<PositionData>(initialCapacity, Allocator.Persistent);
++            cpuInstances = new NativeList<CpuScatterInstance>(initialCapacity, Allocator.Persistent);
++
++            Matrix4x4 objectToWorld = parent.quad.meshRenderer.localToWorldMatrix;
++            int populationMultiplier = scatter.distributionParams.populationMultiplier * (int)Mathf.Pow(2, parent.quad.sphereRoot.maxLevel - parent.quad.subdivision);
++
++            CpuDistributeJob job = new CpuDistributeJob
++            {
++                triangles = parent.nativeTriangles,
++                vertices = parent.nativeVertices,
++                normals = parent.nativeNormals,
++                colors = scatter.distributionParams.coloredByTerrain ? parent.nativeColors : CpuScatterSystem.EmptyFloat4,
++                uvs = parent.nativeUVs,
++                directionsFromCenter = parent.nativeDirectionsFromCenter,
++
++                biomeMap = CpuScatterSystem.BiomeMap,
++                biomeMapWidth = CpuScatterSystem.biomeMapWidth,
++                biomeMapHeight = CpuScatterSystem.biomeMapHeight,
++                scatterBiomes = CpuScatterSystem.GetScatterBiomeColors(scatter),
++
++                blockMap = CpuScatterSystem.EmptyFloat,
++                readBlockMap = 0,
++
++                numTriangles = numTriangles,
++                populationMultiplier = populationMultiplier,
++                maxCount = maxCount,
++                seed = scatter.distributionParams.seed + (float)parent.quad.quadIndex,
++                spawnChance = scatter.distributionParams.spawnChance * parent.sphereRelativeDensityMult,
++                maxNormalDeviance = scatter.distributionParams.maxNormalDeviance,
++                minScale = scatter.distributionParams.minScale,
++                maxScale = scatter.distributionParams.maxScale,
++                scaleRandomness = scatter.distributionParams.scaleRandomness,
++
++                noiseMode = GetCpuNoiseMode(),
++                invertNoise = scatter.noiseParams.inverted ? 1 : 0,
++                noiseOctaves = scatter.noiseParams.octaves,
++                noiseFrequency = scatter.noiseParams.frequency,
++                noiseLacunarity = scatter.noiseParams.lacunarity,
++                noiseSeed = scatter.noiseParams.seed,
++                noiseCutoffThreshold = scatter.distributionParams.noiseCutoff,
++
++                steepPower = scatter.distributionParams.steepPower,
++                steepContrast = scatter.distributionParams.steepContrast,
++                steepMidpoint = scatter.distributionParams.steepMidpoint,
++
++                minAltitude = scatter.distributionParams.minAltitude,
++                maxAltitude = scatter.distributionParams.maxAltitude,
++                altitudeFadeRange = scatter.distributionParams.altitudeFadeRange,
++
++                distributeFixedAltitude = scatter.distributionParams.fixedAltitude ? 1 : 0,
++                fixedAltitude = scatter.distributionParams.placementAltitude,
++
++                objectToWorld = objectToWorld,
++                worldToObject = parent.quad.meshRenderer.worldToLocalMatrix,
++                planetNormal = parent.planetNormal,
++                localPlanetNormal = parent.localPlanetNormal,
++                planetOrigin = parent.planetOrigin,
++                planetRadius = parent.planetRadius,
++
++                alignToTerrainNormal = scatter.distributionParams.alignToTerrainNormal,
++                localUp = GetCpuLocalUp(objectToWorld),
++                coloredByTerrain = scatter.distributionParams.coloredByTerrain ? 1 : 0,
++
++                positions = cpuPositions,
++                instances = cpuInstances
++            };
++
++            if (readBlockMap)
++            {
++                job.readBlockMap = 1;
++                job.blockMap = CpuScatterSystem.GetBlockMap(parent.blockMapPQSMod.colorMap, out job.blockMapWidth, out job.blockMapHeight);
++                job.blockMapDirectionFromCenter = (Vector3)parent.blockMapPQSMod.normalisedPosition;
++                job.blockMapRotation = new float4(parent.blockMapPQSMod.rot.x, parent.blockMapPQSMod.rot.y, parent.blockMapPQSMod.rot.z, parent.blockMapPQSMod.rot.w);
++                job.blockMapRadius = (float)parent.blockMapPQSMod.radius;
++            }
++
++            cpuDistributeHandle = job.Schedule();
++            cpuDistributing = true;
++            CpuScatterSystem.AddPendingDistribution(this);
++
++            // Start it now rather than at the next flush, so it is usually done by the next frame
++            JobHandle.ScheduleBatchedJobs();
++        }
++
++        //
++        //  NOTE: PARITY MUST BE MAINTAINED WITH GetDistributeKernel
++        //
++        int GetCpuNoiseMode()
++        {
++            switch (scatter.noiseParams.noiseType)
++            {
++                case NoiseType.simplexCellular:
++                    return CpuScatterMath.NoiseModeCellular;
++                case NoiseType.simplexPolkaDot:
++                    return CpuScatterMath.NoiseModePolkaDot;
++                default:
++                    return CpuScatterMath.NoiseModePerlin;
++            }
++        }
++
++        /// <summary>
++        /// The planet normal the Evaluate kernel aligns scatters to, in the quad's frame. Constant for a quad, so it is applied at distribution time.
++        /// </summary>
++        Vector3 GetCpuLocalUp(Matrix4x4 objectToWorld)
++        {
++            Vector3 planetNormal = Vector3.Normalize(parent.quad.PrecisePosition - parent.quad.sphereRoot.PrecisePosition);
++            float3x3 rotation = new float3x3((float4x4)objectToWorld);
++            rotation /= math.length(rotation.c0);
++            return math.normalize(math.mul(math.transpose(rotation), (float3)planetNormal));
++        }
++
++        public bool CpuDistributionFinished()
++        {
++            return !cpuDistributing || cpuDistributeHandle.IsCompleted;
++        }
++
++        public void CompleteCpuDistribute()
++        {
++            if (cpuDistributing)
++            {
++                cpuDistributeHandle.Complete();
++            }
++        }
++
++        /// <summary>
++        /// CPU equivalent of OnDistributeComplete
++        /// </summary>
++        public void CpuOnDistributeComplete()
++        {
++            if (!cpuDistributing)
++            {
++                return;
++            }
++            cpuDistributeHandle.Complete();
++            cpuDistributing = false;
++
++            // Data was cleaned up before generation completed - stop here
++            if (cleaned)
++            {
++                return;
++            }
++
++            realCount = cpuInstances.Length;
++
++            // Kill this scatter on this quad, nothing was generated
++            if (realCount == 0)
++            {
++                parent.KillChild(this);
++                return;
++            }
++
++            if (CollidersEligible() && !collidersAdded)
++            {
++                NativeArray<PositionData> colliderData = new NativeArray<PositionData>(cpuPositions.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
++                NativeArray<PositionData>.Copy(cpuPositions.AsArray(), colliderData, cpuPositions.Length);
++
++                collisionData = new ScatterColliderData(parent, colliderData, scatter.collideableArrayIndex);
++                CollisionManager.QueueIncomingData(collisionData);
++                collidersAdded = true;
++            }
++
++            // Positions were only needed for colliders
++            cpuPositions.Dispose();
++
++            cpuInstanceData = new NativeArray<CpuScatterInstance>(realCount, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
++            NativeArray<CpuScatterInstance>.Copy(cpuInstances.AsArray(), cpuInstanceData, realCount);
++            cpuInstances.Dispose();
++
++            count[0] = realCount;
++            eventAdded = true;
++        }
++
++        void CpuEvaluate()
++        {
++            // Not distributed yet, or the renderer is inactive because the body is unloading
++            if (cpuEvaluating || !cpuInstanceData.IsCreated || scatterRenderer.cpuBuffers == null)
++            {
++                return;
++            }
++
++            if (!cpuOutputLOD0.IsCreated)
++            {
++                cpuOutputLOD0 = new NativeList<CpuScatterInstanceRows>(Allocator.Persistent);
++                cpuOutputLOD1 = new NativeList<CpuScatterInstanceRows>(Allocator.Persistent);
++                cpuOutputLOD2 = new NativeList<CpuScatterInstanceRows>(Allocator.Persistent);
++            }
++
++            float4x4 objectToWorld = parent.quad.meshRenderer.localToWorldMatrix;
++            float3x3 quadRotation = new float3x3(objectToWorld);
++            quadRotation /= math.length(quadRotation.c0);
++
++            float[] planes = RuntimeOperations.floatCameraFrustumPlanes;
++            Vector3 referencePosition = scatter.useCraftPosition ? RuntimeOperations.vectorCraftPos : RuntimeOperations.vectorCameraPos;
++
++            CpuEvaluateJob job = new CpuEvaluateJob
++            {
++                instances = cpuInstanceData,
++                objectToWorld = objectToWorld,
++                quadRotation = quadRotation,
++
++                frustumPlane0 = new float4(planes[0], planes[1], planes[2], planes[3]),
++                frustumPlane1 = new float4(planes[4], planes[5], planes[6], planes[7]),
++                frustumPlane2 = new float4(planes[8], planes[9], planes[10], planes[11]),
++                frustumPlane3 = new float4(planes[12], planes[13], planes[14], planes[15]),
++                frustumPlane4 = new float4(planes[16], planes[17], planes[18], planes[19]),
++                frustumPlane5 = new float4(planes[20], planes[21], planes[22], planes[23]),
++
++                cameraPosition = RuntimeOperations.vectorCameraPos,
++                referencePosition = referencePosition,
++
++                maxRange = scatter.distributionParams.range,
++                cullRadius = scatter.optimizationParams.frustumCullingIgnoreRadius,
++                cullLimit = scatter.optimizationParams.frustumCullingSafetyMargin,
++                rangeFadeStart = ConfigLoader.parallaxGlobalSettings.scatterGlobalSettings.fadeOutStartRange,
++                lod01Split = scatter.distributionParams.lod1.range,
++                lod12Split = scatter.distributionParams.lod2.range,
++
++                lod0 = cpuOutputLOD0,
++                lod1 = cpuOutputLOD1,
++                lod2 = cpuOutputLOD2
++            };
++
++            cpuEvaluateHandle = job.Schedule();
++            cpuEvaluating = true;
++            scatterRenderer.AddCpuSource(this);
++        }
++
++        public void CompleteCpuEvaluate()
++        {
++            if (cpuEvaluating)
++            {
++                cpuEvaluateHandle.Complete();
++                cpuEvaluating = false;
++            }
++        }
++
++        public bool HasCpuEvaluateOutput => cpuOutputLOD0.IsCreated && !cpuEvaluating;
++
++        public NativeList<CpuScatterInstanceRows> GetCpuEvaluateOutput(int lod)
++        {
++            switch (lod)
++            {
++                case 0: return cpuOutputLOD0;
++                case 1: return cpuOutputLOD1;
++                default: return cpuOutputLOD2;
++            }
++        }
++
++        /// <summary>
++        /// Wait for any running jobs and free the CPU backend's memory. Colliders are handled separately, as with the GPU buffers.
++        /// </summary>
++        void CpuRelease()
++        {
++            if (cpuDistributing)
++            {
++                cpuDistributeHandle.Complete();
++                cpuDistributing = false;
++                CpuScatterSystem.RemovePendingDistribution(this);
++            }
++            CompleteCpuEvaluate();
++
++            if (cpuPositions.IsCreated) cpuPositions.Dispose();
++            if (cpuInstances.IsCreated) cpuInstances.Dispose();
++            if (cpuInstanceData.IsCreated) cpuInstanceData.Dispose();
++            if (cpuOutputLOD0.IsCreated) cpuOutputLOD0.Dispose();
++            if (cpuOutputLOD1.IsCreated) cpuOutputLOD1.Dispose();
++            if (cpuOutputLOD2.IsCreated) cpuOutputLOD2.Dispose();
+         }
+     }
+ }
+diff --git a/Mod Source/Parallax/PQS Mods/ScatterSystemQuadData.cs b/Mod Source/Parallax/PQS Mods/ScatterSystemQuadData.cs
+index 4150c2e..7a26d28 100644
+--- a/Mod Source/Parallax/PQS Mods/ScatterSystemQuadData.cs	
++++ b/Mod Source/Parallax/PQS Mods/ScatterSystemQuadData.cs	
+@@ -1,6 +1,8 @@
+ ﻿using Parallax.PQS_Mods;
+ using System.Collections.Generic;
+ using System.Linq;
++using Unity.Collections;
++using Unity.Mathematics;
+ using UnityEngine;
+ 
+ namespace Parallax
+@@ -65,6 +67,14 @@ namespace Parallax
+         public ComputeBuffer sourceUVsBuffer;
+         public ComputeBuffer sourceDirsFromCenterBuffer;
+ 
++        // CPU backend equivalents of the buffers above, read by the distribute jobs
++        public NativeArray<float3> nativeVertices;
++        public NativeArray<float3> nativeNormals;
++        public NativeArray<int> nativeTriangles;
++        public NativeArray<float4> nativeColors;
++        public NativeArray<float3> nativeUVs;
++        public NativeArray<float3> nativeDirectionsFromCenter;
++
+         // Stores the scatter components
+         public List<ScatterData> quadScatters = new List<ScatterData>();
+ 
+@@ -93,20 +103,14 @@ namespace Parallax
+             
+             directionsFromCenter = GetDirectionsFromCenter(vertices, quad.sphereRoot.gameObject.transform.position);
+ 
+-            // Create compute buffers
+-            sourceVertsBuffer = new ComputeBuffer(vertices.Length, sizeof(float) * 3, ComputeBufferType.Structured);
+-            sourceNormalsBuffer = new ComputeBuffer(normals.Length, sizeof(float) * 3, ComputeBufferType.Structured);
+-            sourceTrianglesBuffer = new ComputeBuffer(triangles.Length, sizeof(int), ComputeBufferType.Structured);
+-            sourceColorsBuffer = new ComputeBuffer(colors.Length, sizeof(float) * 4, ComputeBufferType.Structured);
+-            sourceUVsBuffer = new ComputeBuffer(uvs.Length, sizeof(float) * 3, ComputeBufferType.Structured);
+-            sourceDirsFromCenterBuffer = new ComputeBuffer(vertices.Length, sizeof(float) * 3, ComputeBufferType.Structured);
+-
+-            sourceVertsBuffer.SetData(vertices);
+-            sourceNormalsBuffer.SetData(normals);
+-            sourceTrianglesBuffer.SetData(triangles);
+-            sourceColorsBuffer.SetData(colors);
+-            sourceUVsBuffer.SetData(uvs);
+-            sourceDirsFromCenterBuffer.SetData(directionsFromCenter);
++            if (CpuScatterSystem.Enabled)
++            {
++                CreateNativeArrays();
++            }
++            else
++            {
++                CreateComputeBuffers();
++            }
+ 
+             numMeshTriangles = triangles.Length / 3;
+ 
+@@ -125,6 +129,38 @@ namespace Parallax
+             UpdateQuadCameraDistance(ref RuntimeOperations.vectorCameraPos);
+             DetermineScatters();
+         }
++        void CreateComputeBuffers()
++        {
++            // Create compute buffers
++            sourceVertsBuffer = new ComputeBuffer(vertices.Length, sizeof(float) * 3, ComputeBufferType.Structured);
++            sourceNormalsBuffer = new ComputeBuffer(normals.Length, sizeof(float) * 3, ComputeBufferType.Structured);
++            sourceTrianglesBuffer = new ComputeBuffer(triangles.Length, sizeof(int), ComputeBufferType.Structured);
++            sourceColorsBuffer = new ComputeBuffer(colors.Length, sizeof(float) * 4, ComputeBufferType.Structured);
++            sourceUVsBuffer = new ComputeBuffer(uvs.Length, sizeof(float) * 3, ComputeBufferType.Structured);
++            sourceDirsFromCenterBuffer = new ComputeBuffer(vertices.Length, sizeof(float) * 3, ComputeBufferType.Structured);
++
++            sourceVertsBuffer.SetData(vertices);
++            sourceNormalsBuffer.SetData(normals);
++            sourceTrianglesBuffer.SetData(triangles);
++            sourceColorsBuffer.SetData(colors);
++            sourceUVsBuffer.SetData(uvs);
++            sourceDirsFromCenterBuffer.SetData(directionsFromCenter);
++        }
++        void CreateNativeArrays()
++        {
++            nativeVertices = new NativeArray<float3>(vertices.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
++            nativeNormals = new NativeArray<float3>(normals.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
++            nativeTriangles = new NativeArray<int>(triangles, Allocator.Persistent);
++            nativeColors = new NativeArray<float4>(colors.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
++            nativeUVs = new NativeArray<float3>(uvs.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
++            nativeDirectionsFromCenter = new NativeArray<float3>(directionsFromCenter.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
++
++            for (int i = 0; i < vertices.Length; i++) nativeVertices[i] = vertices[i];
++            for (int i = 0; i < normals.Length; i++) nativeNormals[i] = normals[i];
++            for (int i = 0; i < colors.Length; i++) nativeColors[i] = new float4(colors[i].r, colors[i].g, colors[i].b, colors[i].a);
++            for (int i = 0; i < uvs.Length; i++) nativeUVs[i] = uvs[i];
++            for (int i = 0; i < directionsFromCenter.Length; i++) nativeDirectionsFromCenter[i] = directionsFromCenter[i];
++        }
+         /// <summary>
+         /// Reinitialize the prerequisite data on this quad that must be refreshed. It does NOT reinitialize all scatters. Use this if regenerating scatters.
+         /// </summary>
+@@ -137,7 +173,19 @@ namespace Parallax
+             planetOrigin = body.transform.position;
+ 
+             directionsFromCenter = GetDirectionsFromCenter(vertices, quad.sphereRoot.gameObject.transform.position);
+-            sourceDirsFromCenterBuffer.SetData(directionsFromCenter);
++            if (CpuScatterSystem.Enabled)
++            {
++                // Distribution jobs from other scatters on this quad may still be reading the directions
++                foreach (ScatterData data in quadScatters)
++                {
++                    data.CompleteCpuDistribute();
++                }
++                for (int i = 0; i < directionsFromCenter.Length; i++) nativeDirectionsFromCenter[i] = directionsFromCenter[i];
++            }
++            else
++            {
++                sourceDirsFromCenterBuffer.SetData(directionsFromCenter);
++            }
+ 
+             sphereRelativeDensityMult = BiomeLoader.GetSphereRelativeDensityMult(body, quad);
+         }
+@@ -461,6 +509,14 @@ namespace Parallax
+             sourceColorsBuffer?.Dispose();
+             sourceUVsBuffer?.Dispose();
+             sourceDirsFromCenterBuffer?.Dispose();
++
++            // Jobs reading these have been completed by the ScatterData cleanup above
++            if (nativeVertices.IsCreated) nativeVertices.Dispose();
++            if (nativeNormals.IsCreated) nativeNormals.Dispose();
++            if (nativeTriangles.IsCreated) nativeTriangles.Dispose();
++            if (nativeColors.IsCreated) nativeColors.Dispose();
++            if (nativeUVs.IsCreated) nativeUVs.Dispose();
++            if (nativeDirectionsFromCenter.IsCreated) nativeDirectionsFromCenter.Dispose();
+         }
+     }
+ }
+diff --git a/Mod Source/Parallax/Scatter System/CPU/CpuScatterJobs.cs b/Mod Source/Parallax/Scatter System/CPU/CpuScatterJobs.cs
+new file mode 100644
+index 0000000..6c28d6c
+--- /dev/null
++++ b/Mod Source/Parallax/Scatter System/CPU/CpuScatterJobs.cs	
+@@ -0,0 +1,408 @@
++using Unity.Burst;
++using Unity.Collections;
++using Unity.Jobs;
++using Unity.Mathematics;
++using UnityEngine;
++
++namespace Parallax
++{
++    /// <summary>
++    /// A distributed scatter, with everything that doesn't change frame to frame precomputed.
++    /// </summary>
++    public struct CpuScatterInstance
++    {
++        // Position in the quad's local space
++        public float3 localPos;
++        // Orientation, random rotation and scale in the quad's frame (TransformToPlanetNormal * RotationY * Scale)
++        public float3x3 localRotationScale;
++        // Terrain colour, or white if the scatter is not coloured by the terrain
++        public float3 color;
++        // Random value used for despawning between the fade start range and max range
++        public float despawnChance;
++    }
++
++    /// <summary>
++    /// One instance in _InstanceDataTex - 4 RGBAFloat texels holding the rows of the object to world matrix.
++    /// The last row stores the terrain colour, exactly like TransformData written by the Evaluate kernel.
++    /// </summary>
++    public struct CpuScatterInstanceRows
++    {
++        public float4 row0;
++        public float4 row1;
++        public float4 row2;
++        public float4 row3;
++    }
++
++    /// <summary>
++    /// CPU equivalent of the Distribute kernel in TerrainScatters.compute. Runs once per scatter per quad.
++    /// </summary>
++    [BurstCompile]
++    public struct CpuDistributeJob : IJob
++    {
++        // Quad mesh data
++        [ReadOnly] public NativeArray<int> triangles;
++        [ReadOnly] public NativeArray<float3> vertices;
++        [ReadOnly] public NativeArray<float3> normals;
++        [ReadOnly] public NativeArray<float4> colors;
++        // UV in xy, allowScatter in z
++        [ReadOnly] public NativeArray<float3> uvs;
++        [ReadOnly] public NativeArray<float3> directionsFromCenter;
++
++        // Planet biome map, point sampled
++        [ReadOnly] public NativeArray<Color32> biomeMap;
++        public int biomeMapWidth;
++        public int biomeMapHeight;
++        // Colours of the biomes this scatter can appear in
++        [ReadOnly] public NativeArray<float3> scatterBiomes;
++
++        // Local block map (red channel), bilinearly sampled. Only read if readBlockMap is 1
++        [ReadOnly] public NativeArray<float> blockMap;
++        public int blockMapWidth;
++        public int blockMapHeight;
++        public int readBlockMap;
++        public float3 blockMapDirectionFromCenter;
++        public float4 blockMapRotation;
++        public float blockMapRadius;
++
++        public int numTriangles;
++        public int populationMultiplier;
++        public int maxCount;
++        public float seed;
++        public float spawnChance;
++        public float maxNormalDeviance;
++        public float3 minScale;
++        public float3 maxScale;
++        public float scaleRandomness;
++
++        public int noiseMode;
++        public int invertNoise;
++        public int noiseOctaves;
++        public float noiseFrequency;
++        public float noiseLacunarity;
++        public int noiseSeed;
++        public float noiseCutoffThreshold;
++
++        public float steepPower;
++        public float steepContrast;
++        public float steepMidpoint;
++
++        public float minAltitude;
++        public float maxAltitude;
++        public float altitudeFadeRange;
++
++        public int distributeFixedAltitude;
++        public float fixedAltitude;
++
++        public float4x4 objectToWorld;
++        public float4x4 worldToObject;
++        public float3 planetNormal;
++        public float3 localPlanetNormal;
++        public float3 planetOrigin;
++        public float planetRadius;
++
++        // Evaluate kernel parameters that are constant per object, so they can be precomputed here
++        public int alignToTerrainNormal;
++        // The planet normal in the quad's frame, used when not aligning to the terrain normal
++        public float3 localUp;
++        public int coloredByTerrain;
++
++        // Outputs
++        public NativeList<PositionData> positions;
++        public NativeList<CpuScatterInstance> instances;
++
++        public void Execute()
++        {
++            for (int id = 0; id < numTriangles; id++)
++            {
++                DistributeTriangle(id);
++            }
++        }
++
++        void DistributeTriangle(int id)
++        {
++            if (id * populationMultiplier > maxCount - 1)
++            {
++                return;
++            }
++
++            int index1 = triangles[id * 3];
++            int index2 = triangles[id * 3 + 1];
++            int index3 = triangles[id * 3 + 2];
++
++            // Skip degenerate triangles on the quad mesh
++            if (index1 == index2 || index2 == index3 || index1 == index3)
++            {
++                return;
++            }
++
++            float3 v1 = vertices[index1];
++            float3 v2 = vertices[index2];
++            float3 v3 = vertices[index3];
++
++            float3 uv1 = uvs[index1];
++            float3 uv2 = uvs[index2];
++            float3 uv3 = uvs[index3];
++
++            float3 n1 = normals[index1];
++            float3 n2 = normals[index2];
++            float3 n3 = normals[index3];
++
++            float3 averageNormal = (n1 + n2 + n3) * 0.333333f;
++            float3 centerUV = (uv1 + uv2 + uv3) * 0.333f;
++
++            // Does the biome at the triangle center match any of the biomes this scatter can appear in?
++            float3 biome = SampleBiomeMap(centerUV.xy);
++            bool biomeEligible = false;
++            for (int b = 0; b < scatterBiomes.Length; b++)
++            {
++                if (CpuScatterMath.BiomeEligible(biome, scatterBiomes[b]))
++                {
++                    biomeEligible = true;
++                    break;
++                }
++            }
++            if (!biomeEligible)
++            {
++                return;
++            }
++
++            float slope = CpuScatterMath.CalculateSlope(averageNormal, localPlanetNormal, steepPower, steepContrast, steepMidpoint);
++            if (slope < 0.025f)
++            {
++                slope = 0;
++            }
++
++            float normalDeviance = CpuScatterMath.GetNormalDeviance(n1, n2, n3);
++            if (normalDeviance < 1.0f - maxNormalDeviance)
++            {
++                return;
++            }
++
++            float3 dfc1 = directionsFromCenter[index1];
++            float3 dfc2 = directionsFromCenter[index2];
++            float3 dfc3 = directionsFromCenter[index3];
++
++            // Per-triangle data used by the Evaluate kernel
++            float3 faceNormal = math.normalize(math.cross(v2 - v1, v3 - v1));
++            float3x3 alignment = CpuScatterMath.TransformToPlanetNormal(new float3(0, 1, 0), alignToTerrainNormal == 0 ? localUp : faceNormal);
++            float3 color = new float3(1, 1, 1);
++            if (coloredByTerrain == 1)
++            {
++                color = (colors[index1].xyz + colors[index2].xyz + colors[index3].xyz) * 0.333f;
++            }
++
++            float3 randomSeed = new float3((float)(uint)index1 + seed, (float)(uint)index2, (float)id);
++
++            for (int i = 0; i < populationMultiplier; i++)
++            {
++                float random1 = CpuScatterMath.Rand(randomSeed + i);
++                float random2 = CpuScatterMath.Rand(randomSeed - i);
++                float random3 = CpuScatterMath.Rand(randomSeed * 0.5f + i);
++                float random4 = CpuScatterMath.Rand(randomSeed * 0.5f - i);
++                float random5 = CpuScatterMath.Rand(randomSeed * 0.25f + i);
++
++                // X must be sqrtd to achieve a uniform distribution
++                float randomX = math.sqrt(random1);
++                float randomY = random2;
++                float3 localPos = CpuScatterMath.RandomPoint(v1, v2, v3, randomX, randomY);
++                float3 localCenterDir = CpuScatterMath.RandomPoint(dfc1, dfc2, dfc3, randomX, randomY);
++                float localAllowScatter = CpuScatterMath.RandomFloat(uv1.z, uv2.z, uv3.z, randomX, randomY);
++
++                if (readBlockMap == 1)
++                {
++                    float quadAngle = math.acos(math.dot(localCenterDir, blockMapDirectionFromCenter));
++                    float inclusionAngle = math.atan(blockMapRadius / planetRadius);
++
++                    if (quadAngle < inclusionAngle)
++                    {
++                        float3 vertexRotation = CpuScatterMath.QuaternionMul(blockMapRotation, localCenterDir);
++
++                        float u = (vertexRotation.x * planetRadius / blockMapRadius + 1.0f) * 0.5f;
++                        float v = (vertexRotation.z * planetRadius / blockMapRadius + 1.0f) * 0.5f;
++
++                        if (SampleBlockMap(new float2(u, v)) < 0.5f)
++                        {
++                            localAllowScatter = 0;
++                        }
++                    }
++                }
++
++                float noise = CpuScatterMath.Noise(localCenterDir, noiseMode, noiseSeed, noiseFrequency, noiseLacunarity, noiseOctaves, invertNoise);
++
++                float noiseScale = CpuScatterMath.LerpStep(noiseCutoffThreshold, 1, noise);
++                float scaleInterpolant = math.lerp(noiseScale, random3, scaleRandomness);
++                float3 scale = math.lerp(minScale, maxScale, scaleInterpolant);
++
++                float3 worldPos = math.mul(objectToWorld, new float4(localPos, 1)).xyz;
++
++                float altitude = math.length(worldPos - planetOrigin) - planetRadius;
++                float altitudeScalar = CpuScatterMath.GetAltitudeScalar(altitude, minAltitude, maxAltitude, altitudeFadeRange);
++
++                if (distributeFixedAltitude == 1)
++                {
++                    float altitudeDiff = altitude - fixedAltitude;
++                    worldPos -= planetNormal * altitudeDiff;
++                    localPos = math.mul(worldToObject, new float4(worldPos, 1)).xyz;
++                }
++
++                float vertexAllowScatter = localAllowScatter > 0.5f ? 1 : 0;
++                bool canSpawn = (random4 < spawnChance * altitudeScalar * slope * vertexAllowScatter) && (noise > noiseCutoffThreshold);
++
++                if (canSpawn)
++                {
++                    float rotation = random5 * 180.0f;
++
++                    positions.Add(new PositionData
++                    {
++                        localPos = localPos,
++                        localScale = scale,
++                        rotation = rotation,
++                        index = (uint)(id * 3)
++                    });
++
++                    instances.Add(new CpuScatterInstance
++                    {
++                        localPos = localPos,
++                        localRotationScale = math.mul(alignment, math.mul(CpuScatterMath.RotationY(rotation), float3x3.Scale(scale))),
++                        color = color,
++                        despawnChance = CpuScatterMath.Rand(localPos)
++                    });
++                }
++            }
++        }
++
++        // Point, clamp
++        float3 SampleBiomeMap(float2 uv)
++        {
++            if (biomeMap.Length == 0)
++            {
++                // No biome data available - treat every biome as eligible
++                return scatterBiomes.Length > 0 ? scatterBiomes[0] : float3.zero;
++            }
++            int x = math.clamp((int)math.floor(uv.x * biomeMapWidth), 0, biomeMapWidth - 1);
++            int y = math.clamp((int)math.floor(uv.y * biomeMapHeight), 0, biomeMapHeight - 1);
++            Color32 c = biomeMap[y * biomeMapWidth + x];
++            return new float3(c.r, c.g, c.b) * (1.0f / 255.0f);
++        }
++
++        // Bilinear, clamp
++        float SampleBlockMap(float2 uv)
++        {
++            if (blockMap.Length == 0)
++            {
++                return 1;
++            }
++            float x = uv.x * blockMapWidth - 0.5f;
++            float y = uv.y * blockMapHeight - 0.5f;
++            float fx0 = math.floor(x);
++            float fy0 = math.floor(y);
++            float tx = x - fx0;
++            float ty = y - fy0;
++            int x0 = math.clamp((int)fx0, 0, blockMapWidth - 1);
++            int y0 = math.clamp((int)fy0, 0, blockMapHeight - 1);
++            int x1 = math.clamp((int)fx0 + 1, 0, blockMapWidth - 1);
++            int y1 = math.clamp((int)fy0 + 1, 0, blockMapHeight - 1);
++            float bottom = math.lerp(blockMap[y0 * blockMapWidth + x0], blockMap[y0 * blockMapWidth + x1], tx);
++            float top = math.lerp(blockMap[y1 * blockMapWidth + x0], blockMap[y1 * blockMapWidth + x1], tx);
++            return math.lerp(bottom, top, ty);
++        }
++    }
++
++    /// <summary>
++    /// CPU equivalent of the Evaluate kernel in TerrainScatters.compute. Runs every frame per scatter per visible quad.
++    /// Frustum and range culls the distributed objects, then sorts them into the three LODs.
++    /// </summary>
++    [BurstCompile]
++    public struct CpuEvaluateJob : IJob
++    {
++        [ReadOnly] public NativeArray<CpuScatterInstance> instances;
++
++        public float4x4 objectToWorld;
++        // The quad's rotation with its scale removed
++        public float3x3 quadRotation;
++
++        public float4 frustumPlane0;
++        public float4 frustumPlane1;
++        public float4 frustumPlane2;
++        public float4 frustumPlane3;
++        public float4 frustumPlane4;
++        public float4 frustumPlane5;
++
++        public float3 cameraPosition;
++        // Camera or craft position, used for range culling
++        public float3 referencePosition;
++
++        public float maxRange;
++        public float cullRadius;
++        public float cullLimit;
++        public float rangeFadeStart;
++        public float lod01Split;
++        public float lod12Split;
++
++        public NativeList<CpuScatterInstanceRows> lod0;
++        public NativeList<CpuScatterInstanceRows> lod1;
++        public NativeList<CpuScatterInstanceRows> lod2;
++
++        public void Execute()
++        {
++            lod0.Clear();
++            lod1.Clear();
++            lod2.Clear();
++
++            for (int i = 0; i < instances.Length; i++)
++            {
++                CpuScatterInstance instance = instances[i];
++                float3 worldPos = math.mul(objectToWorld, new float4(instance.localPos, 1)).xyz;
++
++                float4 cd0 = new float4(
++                    math.dot(frustumPlane0.xyz, worldPos) + frustumPlane0.w,
++                    math.dot(frustumPlane1.xyz, worldPos) + frustumPlane1.w,
++                    math.dot(frustumPlane2.xyz, worldPos) + frustumPlane2.w,
++                    math.dot(frustumPlane3.xyz, worldPos) + frustumPlane3.w);
++                float4 cd1 = new float4(
++                    math.dot(frustumPlane4.xyz, worldPos) + frustumPlane4.w,
++                    math.dot(frustumPlane5.xyz, worldPos) + frustumPlane5.w,
++                    0.00001f,
++                    0.00001f);
++
++                float lodDist = math.distance(cameraPosition, worldPos) / maxRange;
++                float cullingDistance = math.distance(referencePosition, worldPos) / maxRange;
++
++                if (cullingDistance > 1)
++                {
++                    continue;
++                }
++                if (!(math.all(cd0 >= cullLimit) && math.all(cd1 >= cullLimit)) && cullingDistance > cullRadius)
++                {
++                    continue;
++                }
++
++                // Random chance to despawn between the fade start range and the max range
++                if (instance.despawnChance < CpuScatterMath.GetPercentageBetween(cullingDistance, rangeFadeStart, 1))
++                {
++                    continue;
++                }
++
++                float3x3 m = math.mul(quadRotation, instance.localRotationScale);
++                CpuScatterInstanceRows rows;
++                rows.row0 = new float4(m.c0.x, m.c1.x, m.c2.x, worldPos.x);
++                rows.row1 = new float4(m.c0.y, m.c1.y, m.c2.y, worldPos.y);
++                rows.row2 = new float4(m.c0.z, m.c1.z, m.c2.z, worldPos.z);
++                rows.row3 = new float4(instance.color, 1);
++
++                if (lodDist > lod12Split)
++                {
++                    lod2.Add(rows);
++                }
++                else if (lodDist > lod01Split)
++                {
++                    lod1.Add(rows);
++                }
++                else
++                {
++                    lod0.Add(rows);
++                }
++            }
++        }
++    }
++}
+diff --git a/Mod Source/Parallax/Scatter System/CPU/CpuScatterMath.cs b/Mod Source/Parallax/Scatter System/CPU/CpuScatterMath.cs
+new file mode 100644
+index 0000000..fd07aca
+--- /dev/null
++++ b/Mod Source/Parallax/Scatter System/CPU/CpuScatterMath.cs	
+@@ -0,0 +1,385 @@
++using System.Runtime.CompilerServices;
++using Unity.Mathematics;
++
++namespace Parallax
++{
++    /// <summary>
++    /// C# ports of the helper functions in TerrainScatters.compute (ScatterUtils.cginc and gpu_noise_lib.glsl).
++    /// Used by the CPU scatter backend on systems without compute shader support (macOS OpenGL 4.1).
++    /// These must produce the same results as the HLSL versions, so keep them in sync when the shader changes.
++    /// </summary>
++    public static class CpuScatterMath
++    {
++        const float DEG2RAD = 0.01745329251f;
++        const float ALLOWED_COLOR_RANGE = 0.2f;
++
++        // Noise modes, matching NoiseType and the Distribute kernel variants
++        public const int NoiseModePerlin = 0;
++        public const int NoiseModeCellular = 1;
++        public const int NoiseModePolkaDot = 2;
++
++        //
++        //  ScatterUtils.cginc
++        //
++
++        // From: https://www.shadertoy.com/view/4djSRW
++        [MethodImpl(MethodImplOptions.AggressiveInlining)]
++        public static float Rand(float3 p3)
++        {
++            p3 = math.frac(p3 * 0.1031f);
++            p3 += math.dot(p3, p3.zyx + 31.32f);
++            return math.frac((p3.x + p3.y) * p3.z);
++        }
++
++        // r1 must be a sqrt random number
++        [MethodImpl(MethodImplOptions.AggressiveInlining)]
++        public static float3 RandomPoint(float3 p1, float3 p2, float3 p3, float r1, float r2)
++        {
++            return ((1 - r1) * p1) + ((r1 * (1 - r2)) * p2) + ((r2 * r1) * p3);
++        }
++
++        [MethodImpl(MethodImplOptions.AggressiveInlining)]
++        public static float RandomFloat(float f1, float f2, float f3, float r1, float r2)
++        {
++            return ((1 - r1) * f1) + ((r1 * (1 - r2)) * f2) + ((r2 * r1) * f3);
++        }
++
++        [MethodImpl(MethodImplOptions.AggressiveInlining)]
++        public static bool BiomeEligible(float3 biomeColor, float3 scatterColor)
++        {
++            return math.distance(biomeColor, scatterColor) < ALLOWED_COLOR_RANGE;
++        }
++
++        public static float CalculateSlope(float3 normal, float3 localPlanetNormal, float steepPower, float steepContrast, float steepMidpoint)
++        {
++            float slope = math.abs(math.dot(math.normalize(-localPlanetNormal), normal));
++            slope = math.pow(slope, steepPower);
++            slope = math.saturate((slope - steepMidpoint) * steepContrast + steepMidpoint);
++            return slope;
++        }
++
++        public static float GetNormalDeviance(float3 normal1, float3 normal2, float3 normal3)
++        {
++            float nrmDev1 = math.dot(normal2, normal3);
++            float nrmDev2 = math.dot(normal3, normal1);
++            float nrmDev3 = math.dot(normal1, normal2);
++            return math.min(nrmDev1, math.min(nrmDev2, nrmDev3));
++        }
++
++        public static float3 QuaternionMul(float4 rotation, float3 position)
++        {
++            float num = rotation.x * 2.0f;
++            float num2 = rotation.y * 2.0f;
++            float num3 = rotation.z * 2.0f;
++            float num4 = rotation.x * num;
++            float num5 = rotation.y * num2;
++            float num6 = rotation.z * num3;
++            float num7 = rotation.x * num2;
++            float num8 = rotation.x * num3;
++            float num9 = rotation.y * num3;
++            float num10 = rotation.w * num;
++            float num11 = rotation.w * num2;
++            float num12 = rotation.w * num3;
++            float3 result;
++            result.x = (1.0f - (num5 + num6)) * position.x + (num7 - num12) * position.y + (num8 + num11) * position.z;
++            result.y = (num7 + num12) * position.x + (1.0f - (num4 + num6)) * position.y + (num9 - num10) * position.z;
++            result.z = (num8 - num11) * position.x + (num9 + num10) * position.y + (1.0f - (num4 + num5)) * position.z;
++            return result;
++        }
++
++        [MethodImpl(MethodImplOptions.AggressiveInlining)]
++        public static float GetPercentageBetween(float t, float lowerLimit, float upperLimit)
++        {
++            return math.saturate((t - lowerLimit) / (upperLimit - lowerLimit));
++        }
++
++        public static float GetAltitudeScalar(float altitude, float minAltitude, float maxAltitude, float altitudeFadeRange)
++        {
++            float minAltitudeFadeStart = minAltitude + altitudeFadeRange * 0.5f;
++            float minAltitudeFadeEnd = minAltitude - altitudeFadeRange * 0.5f;
++
++            float maxAltitudeFadeStart = maxAltitude + altitudeFadeRange * 0.5f;
++            float maxAltitudeFadeEnd = maxAltitude - altitudeFadeRange * 0.5f;
++
++            float rangeFadeMin = 1 - GetPercentageBetween(altitude, minAltitudeFadeStart, minAltitudeFadeEnd);
++            float rangeFadeMax = GetPercentageBetween(altitude, maxAltitudeFadeStart, maxAltitudeFadeEnd);
++
++            float midpoint = (maxAltitudeFadeStart + minAltitudeFadeEnd) * 0.5f;
++
++            return rangeFadeMin * (altitude < midpoint ? 1 : 0) + rangeFadeMax * (altitude > midpoint ? 1 : 0);
++        }
++
++        [MethodImpl(MethodImplOptions.AggressiveInlining)]
++        public static float LerpStep(float a, float b, float t)
++        {
++            return math.saturate((t - a) / (b - a));
++        }
++
++        /// <summary>
++        /// Rotation that takes normalized vector a to normalized vector b. Equivalent to the upper 3x3 of TransformToPlanetNormal.
++        /// </summary>
++        public static float3x3 TransformToPlanetNormal(float3 a, float3 b)
++        {
++            float3 v = math.cross(a, b);
++            float c = math.dot(a, b);
++
++            float onePlusC = c >= 0 ? 1 + c : math.dot(v, v) / (1 - c);
++            if (onePlusC <= 0)
++            {
++                // b is exactly -a: half a turn around an axis perpendicular to a
++                float3 axis = math.normalize(math.cross(a, math.abs(a.z) < 0.9f ? new float3(0, 0, 1) : new float3(1, 0, 0)));
++                float3 r0 = 2 * axis.x * axis - new float3(1, 0, 0);
++                float3 r1 = 2 * axis.y * axis - new float3(0, 1, 0);
++                float3 r2 = 2 * axis.z * axis - new float3(0, 0, 1);
++                return new float3x3(r0.x, r0.y, r0.z,
++                                    r1.x, r1.y, r1.z,
++                                    r2.x, r2.y, r2.z);
++            }
++
++            // Rodrigues: I + [v]x + [v]x^2 / (1 + c), which is what the shader's transpose(V^2 / (1 + c) + V + I) evaluates to
++            float3x3 skew = new float3x3(0,    -v.z,  v.y,
++                                         v.z,   0,   -v.x,
++                                        -v.y,   v.x,  0);
++            return float3x3.identity + skew + math.mul(skew, skew) * (1 / onePlusC);
++        }
++
++        public static float3x3 RotationY(float angleDegrees)
++        {
++            float angle = angleDegrees * DEG2RAD;
++            float s = math.sin(angle);
++            float c = math.cos(angle);
++            return new float3x3( c, 0, s,
++                                 0, 1, 0,
++                                -s, 0, c);
++        }
++
++        //
++        //  gpu_noise_lib.glsl - Brian Sharpe's GPU noise library, ported for the functions used by the scatter system
++        //
++
++        [MethodImpl(MethodImplOptions.AggressiveInlining)]
++        static float4 Cellular_weight_samples(float4 samples)
++        {
++            samples = samples * 2.0f - 1.0f;
++            return (samples * samples * samples) - math.sign(samples);
++        }
++
++        // Generates 3 random numbers for each of the 8 cell corners
++        static void FAST32_hash_3D(float3 gridcell,
++                                   out float4 lowz_hash_0, out float4 lowz_hash_1, out float4 lowz_hash_2,
++                                   out float4 highz_hash_0, out float4 highz_hash_1, out float4 highz_hash_2)
++        {
++            float2 OFFSET = new float2(50.0f, 161.0f);
++            const float DOMAIN = 69.0f;
++            float3 SOMELARGEFLOATS = new float3(635.298681f, 682.357502f, 668.926525f);
++            float3 ZINC = new float3(48.500388f, 65.294118f, 63.934599f);
++
++            gridcell = gridcell - math.floor(gridcell * (1.0f / DOMAIN)) * DOMAIN;
++            float3 gridcell_inc1 = math.step(gridcell, DOMAIN - 1.5f) * (gridcell + 1.0f);
++
++            float4 P = new float4(gridcell.xy, gridcell_inc1.xy) + OFFSET.xyxy;
++            P *= P;
++            P = P.xzxz * P.yyww;
++            float3 lowz_mod = 1.0f / (SOMELARGEFLOATS + gridcell.zzz * ZINC);
++            float3 highz_mod = 1.0f / (SOMELARGEFLOATS + gridcell_inc1.zzz * ZINC);
++            lowz_hash_0 = math.frac(P * lowz_mod.xxxx);
++            highz_hash_0 = math.frac(P * highz_mod.xxxx);
++            lowz_hash_1 = math.frac(P * lowz_mod.yyyy);
++            highz_hash_1 = math.frac(P * highz_mod.yyyy);
++            lowz_hash_2 = math.frac(P * lowz_mod.zzzz);
++            highz_hash_2 = math.frac(P * highz_mod.zzzz);
++        }
++
++        // Generates 3 random numbers for each of the 4 3D cell corners
++        static void FAST32_hash_3D(float3 gridcell, float3 v1_mask, float3 v2_mask,
++                                   out float4 hash_0, out float4 hash_1, out float4 hash_2)
++        {
++            float2 OFFSET = new float2(50.0f, 161.0f);
++            const float DOMAIN = 69.0f;
++            float3 SOMELARGEFLOATS = new float3(635.298681f, 682.357502f, 668.926525f);
++            float3 ZINC = new float3(48.500388f, 65.294118f, 63.934599f);
++
++            gridcell = gridcell - math.floor(gridcell * (1.0f / DOMAIN)) * DOMAIN;
++            float3 gridcell_inc1 = math.step(gridcell, DOMAIN - 1.5f) * (gridcell + 1.0f);
++
++            float4 P = new float4(gridcell.xy, gridcell_inc1.xy) + OFFSET.xyxy;
++            P *= P;
++            float4 V1xy_V2xy = math.lerp(P.xyxy, P.zwzw, new float4(v1_mask.xy, v2_mask.xy));
++            P = new float4(P.x, V1xy_V2xy.xz, P.z) * new float4(P.y, V1xy_V2xy.yw, P.w);
++
++            float3 lowz_mods = 1.0f / (SOMELARGEFLOATS + gridcell.zzz * ZINC);
++            float3 highz_mods = 1.0f / (SOMELARGEFLOATS + gridcell_inc1.zzz * ZINC);
++
++            v1_mask = (v1_mask.z < 0.5f) ? lowz_mods : highz_mods;
++            v2_mask = (v2_mask.z < 0.5f) ? lowz_mods : highz_mods;
++
++            hash_0 = math.frac(P * new float4(lowz_mods.x, v1_mask.x, v2_mask.x, highz_mods.x));
++            hash_1 = math.frac(P * new float4(lowz_mods.y, v1_mask.y, v2_mask.y, highz_mods.y));
++            hash_2 = math.frac(P * new float4(lowz_mods.z, v1_mask.z, v2_mask.z, highz_mods.z));
++        }
++
++        // Generates 1 random number for each of the 4 3D cell corners
++        static float4 FAST32_hash_3D(float3 gridcell, float3 v1_mask, float3 v2_mask)
++        {
++            float2 OFFSET = new float2(50.0f, 161.0f);
++            const float DOMAIN = 69.0f;
++            const float SOMELARGEFLOAT = 635.298681f;
++            const float ZINC = 48.500388f;
++
++            gridcell = gridcell - math.floor(gridcell * (1.0f / DOMAIN)) * DOMAIN;
++            float3 gridcell_inc1 = math.step(gridcell, DOMAIN - 1.5f) * (gridcell + 1.0f);
++
++            float4 P = new float4(gridcell.xy, gridcell_inc1.xy) + OFFSET.xyxy;
++            P *= P;
++            float4 V1xy_V2xy = math.lerp(P.xyxy, P.zwzw, new float4(v1_mask.xy, v2_mask.xy));
++            P = new float4(P.x, V1xy_V2xy.xz, P.z) * new float4(P.y, V1xy_V2xy.yw, P.w);
++
++            float2 V1z_V2z = new float2(v1_mask.z < 0.5f ? gridcell.z : gridcell_inc1.z, v2_mask.z < 0.5f ? gridcell.z : gridcell_inc1.z);
++            float4 mod_vals = 1.0f / (SOMELARGEFLOAT + new float4(gridcell.z, V1z_V2z, gridcell_inc1.z) * ZINC);
++
++            return math.frac(P * mod_vals);
++        }
++
++        static void Simplex3D_GetCornerVectors(float3 P, out float3 Pi, out float3 Pi_1, out float3 Pi_2,
++                                               out float4 v1234_x, out float4 v1234_y, out float4 v1234_z)
++        {
++            const float SKEWFACTOR = 1.0f / 3.0f;
++            const float UNSKEWFACTOR = 1.0f / 6.0f;
++            const float SIMPLEX_CORNER_POS = 0.5f;
++            const float SIMPLEX_PYRAMID_HEIGHT = 0.70710678118654752440084436210485f;
++
++            P *= SIMPLEX_PYRAMID_HEIGHT;
++
++            // dot(P, scalar) in HLSL broadcasts the scalar, so this is (P.x + P.y + P.z) * scalar
++            Pi = math.floor(P + math.csum(P) * SKEWFACTOR);
++            float3 x0 = P - Pi + math.csum(Pi) * UNSKEWFACTOR;
++            float3 g = math.step(x0.yzx, x0.xyz);
++            float3 l = 1.0f - g;
++            Pi_1 = math.min(g.xyz, l.zxy);
++            Pi_2 = math.max(g.xyz, l.zxy);
++            float3 x1 = x0 - Pi_1 + UNSKEWFACTOR;
++            float3 x2 = x0 - Pi_2 + SKEWFACTOR;
++            float3 x3 = x0 - SIMPLEX_CORNER_POS;
++
++            v1234_x = new float4(x0.x, x1.x, x2.x, x3.x);
++            v1234_y = new float4(x0.y, x1.y, x2.y, x3.y);
++            v1234_z = new float4(x0.z, x1.z, x2.z, x3.z);
++        }
++
++        static float4 Simplex3D_GetSurfletWeights(float4 v1234_x, float4 v1234_y, float4 v1234_z)
++        {
++            float4 surflet_weights = v1234_x * v1234_x + v1234_y * v1234_y + v1234_z * v1234_z;
++            surflet_weights = math.max(0.5f - surflet_weights, 0.0f);
++            return surflet_weights * surflet_weights * surflet_weights;
++        }
++
++        // Range -1 to 1
++        public static float SimplexPerlin3D(float3 P)
++        {
++            Simplex3D_GetCornerVectors(P, out float3 Pi, out float3 Pi_1, out float3 Pi_2, out float4 v1234_x, out float4 v1234_y, out float4 v1234_z);
++
++            FAST32_hash_3D(Pi, Pi_1, Pi_2, out float4 hash_0, out float4 hash_1, out float4 hash_2);
++            hash_0 -= 0.49999f;
++            hash_1 -= 0.49999f;
++            hash_2 -= 0.49999f;
++
++            float4 grad_results = math.rsqrt(hash_0 * hash_0 + hash_1 * hash_1 + hash_2 * hash_2) * (hash_0 * v1234_x + hash_1 * v1234_y + hash_2 * v1234_z);
++
++            const float FINAL_NORMALIZATION = 37.837227241611314102871574478976f;
++            return math.dot(Simplex3D_GetSurfletWeights(v1234_x, v1234_y, v1234_z), grad_results) * FINAL_NORMALIZATION;
++        }
++
++        // Range 0 to 1
++        public static float Cellular3D(float3 P)
++        {
++            float3 Pi = math.floor(P);
++            float3 Pf = P - Pi;
++
++            FAST32_hash_3D(Pi, out float4 hash_x0, out float4 hash_y0, out float4 hash_z0, out float4 hash_x1, out float4 hash_y1, out float4 hash_z1);
++
++            const float JITTER_WINDOW = 0.166666666f;
++            hash_x0 = Cellular_weight_samples(hash_x0) * JITTER_WINDOW + new float4(0.0f, 1.0f, 0.0f, 1.0f);
++            hash_y0 = Cellular_weight_samples(hash_y0) * JITTER_WINDOW + new float4(0.0f, 0.0f, 1.0f, 1.0f);
++            hash_x1 = Cellular_weight_samples(hash_x1) * JITTER_WINDOW + new float4(0.0f, 1.0f, 0.0f, 1.0f);
++            hash_y1 = Cellular_weight_samples(hash_y1) * JITTER_WINDOW + new float4(0.0f, 0.0f, 1.0f, 1.0f);
++            hash_z0 = Cellular_weight_samples(hash_z0) * JITTER_WINDOW + new float4(0.0f, 0.0f, 0.0f, 0.0f);
++            hash_z1 = Cellular_weight_samples(hash_z1) * JITTER_WINDOW + new float4(1.0f, 1.0f, 1.0f, 1.0f);
++
++            float4 dx1 = Pf.xxxx - hash_x0;
++            float4 dy1 = Pf.yyyy - hash_y0;
++            float4 dz1 = Pf.zzzz - hash_z0;
++            float4 dx2 = Pf.xxxx - hash_x1;
++            float4 dy2 = Pf.yyyy - hash_y1;
++            float4 dz2 = Pf.zzzz - hash_z1;
++            float4 d1 = dx1 * dx1 + dy1 * dy1 + dz1 * dz1;
++            float4 d2 = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
++            d1 = math.min(d1, d2);
++            d1.xy = math.min(d1.xy, d1.wz);
++            return math.min(d1.x, d1.y) * (9.0f / 12.0f);
++        }
++
++        // Range 0 to 1
++        public static float SimplexPolkaDot3D(float3 P, float radius, float max_dimness)
++        {
++            Simplex3D_GetCornerVectors(P, out float3 Pi, out float3 Pi_1, out float3 Pi_2, out float4 v1234_x, out float4 v1234_y, out float4 v1234_z);
++
++            float4 hash = FAST32_hash_3D(Pi, Pi_1, Pi_2);
++
++            const float INV_SIMPLEX_TRI_HALF_EDGELEN = 2.3094010767585030580365951220078f;
++            radius = INV_SIMPLEX_TRI_HALF_EDGELEN / radius;
++            v1234_x *= radius;
++            v1234_y *= radius;
++            v1234_z *= radius;
++
++            float4 point_distance = math.max(0, 1.0f - (v1234_x * v1234_x + v1234_y * v1234_y + v1234_z * v1234_z));
++            point_distance = point_distance * point_distance * point_distance;
++            return math.dot(1.0f - hash * max_dimness, point_distance);
++        }
++
++        [MethodImpl(MethodImplOptions.AggressiveInlining)]
++        public static float GetNoiseValue(float3 pos, int noiseMode)
++        {
++            switch (noiseMode)
++            {
++                case NoiseModeCellular:
++                    return Cellular3D(pos) * 2;
++                case NoiseModePolkaDot:
++                    return SimplexPolkaDot3D(pos, 0.3f, 1);
++                default:
++                    return SimplexPerlin3D(pos) * 1.5f;
++            }
++        }
++
++        // Process FBM noise by layering noises on top of each other
++        public static float Noise(float3 dirFromCenter, int noiseMode, int noiseSeed, float noiseFrequency, float noiseLacunarity, int noiseOctaves, int invertNoise)
++        {
++            dirFromCenter += noiseSeed * -3.0f;
++
++            float noiseValue = 0;
++            float frequency = noiseFrequency;
++            float amplitude = 1;
++            const float perOctaveOffset = 2;
++
++            for (int i = 0; i < noiseOctaves; i++)
++            {
++                dirFromCenter += perOctaveOffset;
++
++                frequency *= noiseLacunarity;
++                amplitude *= 0.5f;
++
++                noiseValue += GetNoiseValue(dirFromCenter * frequency, noiseMode) * amplitude;
++            }
++
++            if (invertNoise == 1)
++            {
++                noiseValue = 1 - math.abs(noiseValue);
++            }
++            else
++            {
++                noiseValue = noiseValue * 0.5f + 0.5f;
++            }
++
++            return noiseValue;
++        }
++    }
++}
+diff --git a/Mod Source/Parallax/Scatter System/CPU/CpuScatterSystem.cs b/Mod Source/Parallax/Scatter System/CPU/CpuScatterSystem.cs
+new file mode 100644
+index 0000000..0de4652
+--- /dev/null
++++ b/Mod Source/Parallax/Scatter System/CPU/CpuScatterSystem.cs	
+@@ -0,0 +1,366 @@
++﻿using System;
++using System.Collections.Generic;
++using Unity.Collections;
++using Unity.Mathematics;
++using UnityEngine;
++
++namespace Parallax
++{
++    /// <summary>
++    /// CPU scatter backend, used when the graphics API has no compute shader support.
++    /// KSP on macOS runs on OpenGL 4.1, which has no compute shaders or structured buffers, so the Distribute and
++    /// Evaluate kernels run as Burst jobs instead and the instance data is handed to the scatter shaders in a float texture.
++    /// </summary>
++    public static class CpuScatterSystem
++    {
++        static bool? enabled;
++        public static bool Enabled
++        {
++            get
++            {
++                if (enabled == null)
++                {
++                    enabled = !SystemInfo.supportsComputeShaders;
++                }
++                return enabled.Value;
++            }
++        }
++
++        // Distributions that have been scheduled but not processed yet
++        static readonly List<ScatterData> pendingDistributions = new List<ScatterData>();
++
++        // Current body biome map, point sampled by the distribute job
++        public static NativeArray<Color32> biomeMap;
++        public static int biomeMapWidth;
++        public static int biomeMapHeight;
++
++        static readonly Dictionary<Scatter, NativeArray<float3>> scatterBiomeColors = new Dictionary<Scatter, NativeArray<float3>>();
++        static readonly Dictionary<MapSO, NativeArray<float>> blockMaps = new Dictionary<MapSO, NativeArray<float>>();
++
++        // Valid zero length arrays for job inputs that aren't used
++        static NativeArray<float4> emptyFloat4;
++        static NativeArray<float> emptyFloat;
++        static NativeArray<Color32> emptyColor32;
++
++        public static NativeArray<float4> EmptyFloat4 => emptyFloat4.IsCreated ? emptyFloat4 : (emptyFloat4 = new NativeArray<float4>(0, Allocator.Persistent));
++        public static NativeArray<float> EmptyFloat => emptyFloat.IsCreated ? emptyFloat : (emptyFloat = new NativeArray<float>(0, Allocator.Persistent));
++        public static NativeArray<Color32> BiomeMap => biomeMap.IsCreated ? biomeMap : (emptyColor32.IsCreated ? emptyColor32 : (emptyColor32 = new NativeArray<Color32>(0, Allocator.Persistent)));
++
++        public static void LogStatus()
++        {
++            if (Enabled)
++            {
++                ParallaxDebug.Log("Compute shaders are not supported by " + SystemInfo.graphicsDeviceType + " - scatters will be generated on the CPU with Burst jobs");
++            }
++        }
++
++        /// <summary>
++        /// Read the biome map of the body that just became dominant. Sampled directly from the map rather than the
++        /// compiled texture, because KSP and Kopernicus compile biome maps to unreadable textures.
++        /// </summary>
++        public static void LoadBody(CelestialBody body, IEnumerable<Scatter> scatters)
++        {
++            UnloadBody();
++
++            System.Diagnostics.Stopwatch stopwatch = System.Diagnostics.Stopwatch.StartNew();
++            CBAttributeMapSO map = body.BiomeMap;
++            if (map != null && map.Width > 0 && map.Height > 0)
++            {
++                try
++                {
++                    biomeMapWidth = map.Width;
++                    biomeMapHeight = map.Height;
++                    biomeMap = new NativeArray<Color32>(biomeMapWidth * biomeMapHeight, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
++                    for (int y = 0; y < biomeMapHeight; y++)
++                    {
++                        int row = y * biomeMapWidth;
++                        for (int x = 0; x < biomeMapWidth; x++)
++                        {
++                            biomeMap[row + x] = map.GetPixelColor32(x, y);
++                        }
++                    }
++                }
++                catch (Exception e)
++                {
++                    ParallaxDebug.LogError("Unable to read the biome map of " + body.name + ", scatters will ignore biomes: " + e.Message);
++                    if (biomeMap.IsCreated)
++                    {
++                        biomeMap.Dispose();
++                    }
++                    biomeMapWidth = 0;
++                    biomeMapHeight = 0;
++                }
++            }
++
++            foreach (Scatter scatter in scatters)
++            {
++                scatterBiomeColors[scatter] = GetBiomeColors(scatter);
++            }
++            ParallaxDebug.Log("[CPU Scatters] Read biome map for " + body.name + " (" + biomeMapWidth + "x" + biomeMapHeight + ") in " + stopwatch.Elapsed.TotalMilliseconds.ToString("F1") + " ms");
++        }
++
++        public static void UnloadBody()
++        {
++            CompleteAllDistributions();
++
++            if (biomeMap.IsCreated)
++            {
++                biomeMap.Dispose();
++            }
++            biomeMapWidth = 0;
++            biomeMapHeight = 0;
++
++            foreach (NativeArray<float3> colors in scatterBiomeColors.Values)
++            {
++                colors.Dispose();
++            }
++            scatterBiomeColors.Clear();
++
++            foreach (NativeArray<float> blockMap in blockMaps.Values)
++            {
++                blockMap.Dispose();
++            }
++            blockMaps.Clear();
++        }
++
++        /// <summary>
++        /// Colours of the biomes the scatter can appear in, read back from the biome control map so they are quantized exactly like the GPU path.
++        /// </summary>
++        static NativeArray<float3> GetBiomeColors(Scatter scatter)
++        {
++            if (scatter.biomeControlMap == null || scatter.biomeCount <= 0)
++            {
++                return new NativeArray<float3>(0, Allocator.Persistent);
++            }
++
++            Color32[] pixels = scatter.biomeControlMap.GetPixels32();
++            int count = Mathf.Min(scatter.biomeCount, pixels.Length);
++            NativeArray<float3> colors = new NativeArray<float3>(count, Allocator.Persistent);
++            for (int i = 0; i < count; i++)
++            {
++                Color32 c = pixels[i];
++                colors[i] = new float3(c.r, c.g, c.b) * (1.0f / 255.0f);
++            }
++            return colors;
++        }
++
++        public static NativeArray<float3> GetScatterBiomeColors(Scatter scatter)
++        {
++            if (!scatterBiomeColors.TryGetValue(scatter, out NativeArray<float3> colors))
++            {
++                colors = GetBiomeColors(scatter);
++                scatterBiomeColors[scatter] = colors;
++            }
++            return colors;
++        }
++
++        /// <summary>
++        /// The red channel of a MapDecal block map, cached until the body unloads
++        /// </summary>
++        public static NativeArray<float> GetBlockMap(MapSO map, out int width, out int height)
++        {
++            width = map.Width;
++            height = map.Height;
++            if (!blockMaps.TryGetValue(map, out NativeArray<float> data))
++            {
++                data = new NativeArray<float>(width * height, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
++                for (int y = 0; y < height; y++)
++                {
++                    for (int x = 0; x < width; x++)
++                    {
++                        data[y * width + x] = map.GetPixelColor(x, y).r;
++                    }
++                }
++                blockMaps.Add(map, data);
++            }
++            return data;
++        }
++
++        public static void AddPendingDistribution(ScatterData data)
++        {
++            pendingDistributions.Add(data);
++        }
++
++        public static void RemovePendingDistribution(ScatterData data)
++        {
++            pendingDistributions.Remove(data);
++        }
++
++        /// <summary>
++        /// Process distributions whose jobs have finished. Called once per frame before evaluating.
++        /// </summary>
++        public static void PollDistributions()
++        {
++            for (int i = pendingDistributions.Count - 1; i >= 0; i--)
++            {
++                // Processing a distribution runs other Parallax code, so don't assume the list is unchanged
++                if (i >= pendingDistributions.Count)
++                {
++                    continue;
++                }
++                ScatterData data = pendingDistributions[i];
++                if (data.CpuDistributionFinished())
++                {
++                    pendingDistributions.RemoveAt(i);
++                    data.CpuOnDistributeComplete();
++                }
++            }
++        }
++
++        /// <summary>
++        /// Wait for every scheduled distribution job. Their results are still processed by PollDistributions.
++        /// Must be called before freeing data the jobs read, such as the biome map.
++        /// </summary>
++        public static void CompleteAllDistributions()
++        {
++            foreach (ScatterData data in pendingDistributions)
++            {
++                data.CompleteCpuDistribute();
++            }
++        }
++    }
++
++    /// <summary>
++    /// Holds one LOD's instance data for a scatter renderer as a float texture, read by the scatter shaders with SV_InstanceID.
++    /// Each instance is 4 texels (the rows of its object to world matrix), 256 instances per row.
++    /// </summary>
++    public class CpuInstanceTexture
++    {
++        public const int TextureWidth = 1024;
++        public const int InstancesPerRow = TextureWidth / 4;
++
++        // Shrink the texture if it has been at least 4x too large for this many frames
++        const int ShrinkDelayFrames = 300;
++
++        public Texture2D texture;
++        public int count;
++        // Matches the GPU path's append buffer capacity, beyond which objects are dropped
++        readonly int maxCount;
++        int framesOversized = 0;
++        readonly string name;
++
++        public CpuInstanceTexture(string name, int maxCount)
++        {
++            this.name = name;
++            this.maxCount = Mathf.Max(maxCount, 1);
++        }
++
++        public void Upload(List<ScatterData> sources, int lod)
++        {
++            int total = 0;
++            foreach (ScatterData source in sources)
++            {
++                if (source.HasCpuEvaluateOutput)
++                {
++                    total += source.GetCpuEvaluateOutput(lod).Length;
++                }
++            }
++
++            count = Mathf.Min(total, maxCount);
++            if (count == 0)
++            {
++                return;
++            }
++
++            EnsureCapacity(count);
++
++            NativeArray<CpuScatterInstanceRows> textureData = texture.GetRawTextureData<CpuScatterInstanceRows>();
++            int offset = 0;
++            foreach (ScatterData source in sources)
++            {
++                if (!source.HasCpuEvaluateOutput)
++                {
++                    continue;
++                }
++                NativeList<CpuScatterInstanceRows> output = source.GetCpuEvaluateOutput(lod);
++                int length = Mathf.Min(output.Length, count - offset);
++                if (length > 0)
++                {
++                    NativeArray<CpuScatterInstanceRows>.Copy(output.AsArray(), 0, textureData, offset, length);
++                    offset += length;
++                }
++            }
++
++            texture.Apply(false, false);
++        }
++
++        void EnsureCapacity(int instanceCount)
++        {
++            int rows = (instanceCount + InstancesPerRow - 1) / InstancesPerRow;
++            int height = Mathf.NextPowerOfTwo(Mathf.Max(rows, 1));
++
++            if (texture != null)
++            {
++                if (texture.height >= height && texture.height <= height * 4)
++                {
++                    framesOversized = 0;
++                    return;
++                }
++                if (texture.height > height * 4 && ++framesOversized < ShrinkDelayFrames)
++                {
++                    return;
++                }
++                UnityEngine.Object.Destroy(texture);
++            }
++
++            framesOversized = 0;
++            texture = new Texture2D(TextureWidth, height, TextureFormat.RGBAFloat, false, true)
++            {
++                name = name,
++                filterMode = FilterMode.Point,
++                wrapMode = TextureWrapMode.Clamp,
++                anisoLevel = 0
++            };
++        }
++
++        public void Release()
++        {
++            if (texture != null)
++            {
++                UnityEngine.Object.Destroy(texture);
++                texture = null;
++            }
++            count = 0;
++        }
++    }
++
++    /// <summary>
++    /// The per renderer instance textures. Shared scatters reference their parent's.
++    /// </summary>
++    public class CpuScatterRenderBuffers
++    {
++        public readonly CpuInstanceTexture lod0;
++        public readonly CpuInstanceTexture lod1;
++        public readonly CpuInstanceTexture lod2;
++
++        // ScatterData evaluated this frame
++        public readonly List<ScatterData> sources = new List<ScatterData>();
++
++        public CpuScatterRenderBuffers(string scatterName, int[] maxCounts)
++        {
++            lod0 = new CpuInstanceTexture(scatterName + " LOD0", maxCounts[0]);
++            lod1 = new CpuInstanceTexture(scatterName + " LOD1", maxCounts[1]);
++            lod2 = new CpuInstanceTexture(scatterName + " LOD2", maxCounts[2]);
++        }
++
++        public void Upload()
++        {
++            foreach (ScatterData source in sources)
++            {
++                source.CompleteCpuEvaluate();
++            }
++            lod0.Upload(sources, 0);
++            lod1.Upload(sources, 1);
++            lod2.Upload(sources, 2);
++            sources.Clear();
++        }
++
++        public void Release()
++        {
++            sources.Clear();
++            lod0.Release();
++            lod1.Release();
++            lod2.Release();
++        }
++    }
++}
+diff --git a/Mod Source/Parallax/Scatter System/ScatterManager.cs b/Mod Source/Parallax/Scatter System/ScatterManager.cs
+index 9b7b68c..aa26319 100644
+--- a/Mod Source/Parallax/Scatter System/ScatterManager.cs	
++++ b/Mod Source/Parallax/Scatter System/ScatterManager.cs	
+@@ -72,17 +72,28 @@ namespace Parallax
+                 // on the graphics thread being idle. KopernicusCBAttributeMapSO.CompileToTexture
+                 // creates a new texture and that can block the render thread for quite a bit when
+                 // large textures are used.
+-                foreach (Scatter scatter in ConfigLoader.parallaxScatterBodies[bodyName].fastScatters)
++                if (CpuScatterSystem.Enabled)
+                 {
+-                    scatter.InitShader();
++                    // No compute shaders - scatters are distributed on the CPU, which reads the biome map directly
++                    if (!isRestart)
++                    {
++                        CpuScatterSystem.LoadBody(FlightGlobals.GetBodyByName(bodyName), ConfigLoader.parallaxScatterBodies[bodyName].fastScatters);
++                    }
+                 }
+-
+-                if (!isRestart)
++                else
+                 {
+-                    if (currentBiomeMap != null)
+-                        UnityEngine.Object.Destroy(currentBiomeMap);
++                    foreach (Scatter scatter in ConfigLoader.parallaxScatterBodies[bodyName].fastScatters)
++                    {
++                        scatter.InitShader();
++                    }
++
++                    if (!isRestart)
++                    {
++                        if (currentBiomeMap != null)
++                            UnityEngine.Object.Destroy(currentBiomeMap);
+ 
+-                    currentBiomeMap = FlightGlobals.GetBodyByName(bodyName).BiomeMap.CompileToTexture();
++                        currentBiomeMap = FlightGlobals.GetBodyByName(bodyName).BiomeMap.CompileToTexture();
++                    }
+                 }
+ 
+                 foreach (ScatterRenderer renderer in scatterRenderers)
+@@ -109,9 +120,12 @@ namespace Parallax
+                 }
+                 activeScatterRenderers.Clear();
+ 
+-                foreach (Scatter scatter in ConfigLoader.parallaxScatterBodies[bodyName].fastScatters)
++                if (!CpuScatterSystem.Enabled)
+                 {
+-                    scatter.UnloadShader();
++                    foreach (Scatter scatter in ConfigLoader.parallaxScatterBodies[bodyName].fastScatters)
++                    {
++                        scatter.UnloadShader();
++                    }
+                 }
+ 
+                 ParallaxScatterBody body = ConfigLoader.parallaxScatterBodies[bodyName];
+@@ -120,6 +134,10 @@ namespace Parallax
+                 {
+                     body.UnloadTextures();
+                     UnityEngine.Object.Destroy(currentBiomeMap);
++                    if (CpuScatterSystem.Enabled)
++                    {
++                        CpuScatterSystem.UnloadBody();
++                    }
+                 }
+             }
+         }
+@@ -140,6 +158,12 @@ namespace Parallax
+             lastEvaluatedFrame = Time.frameCount;
+             RuntimeOperations.UpdateCameraData();
+ 
++            if (CpuScatterSystem.Enabled)
++            {
++                // Process finished distribution jobs (adds colliders, like the GPU readback callbacks)
++                CpuScatterSystem.PollDistributions();
++            }
++
+             // Clear the buffers
+             foreach (ScatterRenderer renderer in activeScatterRenderers)
+             {
+@@ -161,7 +185,20 @@ namespace Parallax
+ 
+             // Schedule drawing instanced data to screen
+ 
+-            if (SystemInfo.graphicsDeviceType == UnityEngine.Rendering.GraphicsDeviceType.Direct3D11)
++            if (CpuScatterSystem.Enabled)
++            {
++                // Evaluate jobs were scheduled by EvaluateQuad - start them, then gather the results
++                JobHandle.ScheduleBatchedJobs();
++                foreach (ScatterRenderer renderer in activeScatterRenderers)
++                {
++                    renderer.UploadCpu();
++                }
++                foreach (ScatterRenderer renderer in activeScatterRenderers)
++                {
++                    renderer.RenderCpu(FlightCamera.fetch.cameras);
++                }
++            }
++            else if (SystemInfo.graphicsDeviceType == UnityEngine.Rendering.GraphicsDeviceType.Direct3D11)
+             {
+                 foreach (ScatterRenderer renderer in activeScatterRenderers)
+                 {
+@@ -210,6 +247,11 @@ namespace Parallax
+             }
+ 
+             ParallaxDebug.Log("Quads with color buffer: " +  quadsWithColorBuffer);
++
++            if (CpuScatterSystem.Enabled)
++            {
++                CpuScatterSystem.UnloadBody();
++            }
+         }
+     }
+ }
+diff --git a/Mod Source/Parallax/Scatter System/ScatterRenderer.cs b/Mod Source/Parallax/Scatter System/ScatterRenderer.cs
+index 28eeb4a..753b8d1 100644
+--- a/Mod Source/Parallax/Scatter System/ScatterRenderer.cs	
++++ b/Mod Source/Parallax/Scatter System/ScatterRenderer.cs	
+@@ -33,11 +33,18 @@ namespace Parallax
+ 
+         Bounds rendererBounds;
+ 
++        // CPU backend - instance data textures, shared with this renderer's shared scatters
++        public CpuScatterRenderBuffers cpuBuffers;
++        static readonly int instanceDataTexID = Shader.PropertyToID("_InstanceDataTex");
++
+         public void Enable()
+         {
+             Prerequisites();
+             Initialize();
+-            FirstTimeArgs();
++            if (!CpuScatterSystem.Enabled)
++            {
++                FirstTimeArgs();
++            }
+         }
+         // Assign materials and meshes
+         void Prerequisites()
+@@ -248,46 +255,65 @@ namespace Parallax
+             SetMaterialParams(scatter.distributionParams.lod2.materialOverride, instancedMaterialLOD2);
+         }
+ 
+-        void Initialize()
++        /// <summary>
++        /// The capacity of each LOD's output buffer, which caps how many objects are rendered
++        /// </summary>
++        int[] CalculateMaxRenderableCounts()
+         {
+-            if (!scatter.isShared)
+-            {
+-                float originalRange = scatter.distributionParams.originalRange;
+-                float newRange = scatter.distributionParams.range;
++            float originalRange = scatter.distributionParams.originalRange;
++            float newRange = scatter.distributionParams.range;
+ 
+-                float densityFactor = (float)scatter.distributionParams.populationMultiplier
+-                    / Math.Max(scatter.distributionParams.rescalePopulationMultiplier, 1)
+-                    / Math.Max(scatter.distributionParams.originalPopulationMultiplier, 1);
++            float densityFactor = (float)scatter.distributionParams.populationMultiplier
++                / Math.Max(scatter.distributionParams.rescalePopulationMultiplier, 1)
++                / Math.Max(scatter.distributionParams.originalPopulationMultiplier, 1);
+ 
+-                int[] configuredCounts =
+-                {
+-                    scatter.optimizationParams.maxRenderableObjectsLOD0,
+-                    scatter.optimizationParams.maxRenderableObjectsLOD1,
+-                    scatter.optimizationParams.maxRenderableObjectsLOD2
+-                };
+-                float[] bandEdges =
+-                {
+-                    0,
+-                    scatter.distributionParams.lod1.range * newRange,
+-                    scatter.distributionParams.lod2.range * newRange,
+-                    float.MaxValue
+-                };
++            int[] configuredCounts =
++            {
++                scatter.optimizationParams.maxRenderableObjectsLOD0,
++                scatter.optimizationParams.maxRenderableObjectsLOD1,
++                scatter.optimizationParams.maxRenderableObjectsLOD2
++            };
++            float[] bandEdges =
++            {
++                0,
++                scatter.distributionParams.lod1.range * newRange,
++                scatter.distributionParams.lod2.range * newRange,
++                float.MaxValue
++            };
++
++            int[] newCounts = new int[3];
++            float objectsPerArea = float.MaxValue;
++            for (int i = 0; i < 3; i++)
++            {
++                float originalArea = LODBandArea(bandEdges[i], bandEdges[i + 1], originalRange);
++                float newArea = LODBandArea(bandEdges[i], bandEdges[i + 1], newRange);
+ 
+-                int[] newCounts = new int[3];
+-                float objectsPerArea = float.MaxValue;
+-                for (int i = 0; i < 3; i++)
++                if (originalArea > 0)
+                 {
+-                    float originalArea = LODBandArea(bandEdges[i], bandEdges[i + 1], originalRange);
+-                    float newArea = LODBandArea(bandEdges[i], bandEdges[i + 1], newRange);
++                    objectsPerArea = Mathf.Min(objectsPerArea, configuredCounts[i] / originalArea);
++                }
++
++                float estimatedCount = objectsPerArea == float.MaxValue ? configuredCounts[i] : objectsPerArea * newArea;
++                newCounts[i] = Mathf.Max(Mathf.CeilToInt(estimatedCount * densityFactor), configuredCounts[i]);
++            }
+ 
+-                    if (originalArea > 0)
+-                    {
+-                        objectsPerArea = Mathf.Min(objectsPerArea, configuredCounts[i] / originalArea);
+-                    }
++            return newCounts;
++        }
+ 
+-                    float estimatedCount = objectsPerArea == float.MaxValue ? configuredCounts[i] : objectsPerArea * newArea;
+-                    newCounts[i] = Mathf.Max(Mathf.CeilToInt(estimatedCount * densityFactor), configuredCounts[i]);
+-                }
++        void Initialize()
++        {
++            if (CpuScatterSystem.Enabled)
++            {
++                cpuBuffers = scatter.isShared
++                    ? ScatterManager.Instance.GetSharedScatterRenderer(scatter as SharedScatter).cpuBuffers
++                    : new CpuScatterRenderBuffers(scatter.scatterName, CalculateMaxRenderableCounts());
++                rendererBounds = new Bounds(Vector3.zero, Vector3.one * 50000.0f);
++                return;
++            }
++
++            if (!scatter.isShared)
++            {
++                int[] newCounts = CalculateMaxRenderableCounts();
+ 
+                 outputLOD0 = new ComputeBuffer(newCounts[0], TransformData.Size(), ComputeBufferType.Append);
+                 outputLOD1 = new ComputeBuffer(newCounts[1], TransformData.Size(), ComputeBufferType.Append);
+@@ -365,6 +391,11 @@ namespace Parallax
+         // Called on Update from ScatterManager.cs
+         public void PreRender()
+         {
++            if (CpuScatterSystem.Enabled)
++            {
++                return;
++            }
++
+             // Hugely important we set the count to 0 or the buffer will keep filling up
+             // For shared scatters, this is already done in the parent scatter renderer so we can skip it here
+ 
+@@ -405,12 +436,57 @@ namespace Parallax
+             }
+         }
+ 
++        /// <summary>
++        /// CPU backend: a ScatterData scheduled its evaluate job this frame
++        /// </summary>
++        public void AddCpuSource(ScatterData data)
++        {
++            cpuBuffers.sources.Add(data);
++        }
++        /// <summary>
++        /// CPU backend: wait for this frame's evaluate jobs and upload the results. Shared scatter renderers use their parent's upload.
++        /// </summary>
++        public void UploadCpu()
++        {
++            if (!scatter.isShared)
++            {
++                cpuBuffers.Upload();
++            }
++        }
++        /// <summary>
++        /// CPU backend: equivalent of RenderInCameras. The instance count is known on the CPU so there is no indirect args buffer.
++        /// </summary>
++        public void RenderCpu(params Camera[] cameras)
++        {
++            RenderCpuLOD(meshLOD0, instancedMaterialLOD0, cpuBuffers.lod0, cameras);
++            RenderCpuLOD(meshLOD1, instancedMaterialLOD1, cpuBuffers.lod1, cameras);
++            RenderCpuLOD(meshLOD2, instancedMaterialLOD2, cpuBuffers.lod2, cameras);
++        }
++        void RenderCpuLOD(Mesh mesh, Material material, CpuInstanceTexture instances, Camera[] cameras)
++        {
++            if (instances.count == 0 || instances.texture == null)
++            {
++                return;
++            }
++
++            material.SetTexture(instanceDataTexID, instances.texture);
++            foreach (Camera cam in cameras)
++            {
++                Graphics.DrawMeshInstancedProcedural(mesh, 0, material, rendererBounds, instances.count, null, UnityEngine.Rendering.ShadowCastingMode.On, true, 15, cam);
++            }
++        }
++
+         /// <summary>
+         /// Log performance stats. Outputs the number of triangles in total being rendered by this renderer
+         /// </summary>
+         /// <returns></returns>
+         public int LogStats()
+         {
++            if (CpuScatterSystem.Enabled)
++            {
++                return LogCpuStats();
++            }
++
+             ComputeBuffer countBuffer0 = new ComputeBuffer(3, sizeof(int), ComputeBufferType.IndirectArguments);
+             ComputeBuffer countBuffer1 = new ComputeBuffer(3, sizeof(int), ComputeBufferType.IndirectArguments);
+             ComputeBuffer countBuffer2 = new ComputeBuffer(3, sizeof(int), ComputeBufferType.IndirectArguments);
+@@ -459,6 +535,23 @@ namespace Parallax
+ 
+             return numTotalTris;
+         }
++        int LogCpuStats()
++        {
++            int countLOD0 = cpuBuffers?.lod0.count ?? 0;
++            int countLOD1 = cpuBuffers?.lod1.count ?? 0;
++            int countLOD2 = cpuBuffers?.lod2.count ?? 0;
++
++            int trisLOD0 = (meshLOD0.triangles.Length / 3) * countLOD0;
++            int trisLOD1 = (meshLOD1.triangles.Length / 3) * countLOD1;
++            int trisLOD2 = (meshLOD2.triangles.Length / 3) * countLOD2;
++
++            ParallaxDebug.Log("Scatter (CPU): " + scatter.scatterName);
++            ParallaxDebug.Log(" - Count (LOD 0): " + countLOD0 + ", triangles: " + trisLOD0);
++            ParallaxDebug.Log(" - Count (LOD 1): " + countLOD1 + ", triangles: " + trisLOD1);
++            ParallaxDebug.Log(" - Count (LOD 2): " + countLOD2 + ", triangles: " + trisLOD2);
++
++            return trisLOD0 + trisLOD1 + trisLOD2;
++        }
+         void Cleanup()
+         {
+             ReleaseBuffers();
+@@ -479,6 +572,15 @@ namespace Parallax
+             indirectArgsLOD0?.Dispose();
+             indirectArgsLOD1?.Dispose();
+             indirectArgsLOD2?.Dispose();
++
++            if (cpuBuffers != null)
++            {
++                if (!scatter.isShared)
++                {
++                    cpuBuffers.Release();
++                }
++                cpuBuffers = null;
++            }
+         }
+         public void Disable()
+         {

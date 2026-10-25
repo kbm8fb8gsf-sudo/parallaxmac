@@ -1,0 +1,17 @@
+# Build output from scripts/build-mac.sh (upstream checkout, Unity project, staged GameData)
+/build/
+
+# Unity, if the bundle project is opened directly
+/unity/ParallaxMacShaders/Library/
+/unity/ParallaxMacShaders/Temp/
+/unity/ParallaxMacShaders/Logs/
+/unity/ParallaxMacShaders/obj/
+/unity/ParallaxMacShaders/UserSettings/
+/unity/ParallaxMacShaders/Assets/Shaders/
+/unity/ParallaxMacShaders/Assets/Shaders.meta
+
+# dotnet
+bin/
+obj/
+
+.DS_Store

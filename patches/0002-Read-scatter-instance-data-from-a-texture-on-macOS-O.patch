@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 17:43:44 +0000
+Subject: [PATCH 2/4] Read scatter instance data from a texture on macOS OpenGL
+
+When PARALLAX_TEXTURE_INSTANCING_GLCORE is defined (by the macOS build, in
+ParallaxScatterPlatform.cginc), the OpenGL variants of the scatter shaders
+fetch each instance's transform from _InstanceDataTex with Texture2D.Load
+instead of a StructuredBuffer, which macOS OpenGL 4.1 doesn't support.
+Metal, DirectX and Vulkan variants still use _InstanceData.
+---
+ .../ParallaxScatterPlatform.cginc             |  7 +++++
+ .../ParallaxScatterStructs.cginc              | 28 +++++++++++++++++++
+ .../ParallaxScatterUtils.cginc                |  6 +++-
+ 3 files changed, 40 insertions(+), 1 deletion(-)
+ create mode 100644 Assets/Shaders/Scatters/InstancingShaders/ParallaxScatterPlatform.cginc
+
+diff --git a/Assets/Shaders/Scatters/InstancingShaders/ParallaxScatterPlatform.cginc b/Assets/Shaders/Scatters/InstancingShaders/ParallaxScatterPlatform.cginc
+new file mode 100644
+index 0000000..2370c90
+--- /dev/null
++++ b/Assets/Shaders/Scatters/InstancingShaders/ParallaxScatterPlatform.cginc
+@@ -0,0 +1,7 @@
++//
++//  Parallax Scatter Platform
++//  The macOS port's build script overwrites this file with
++//      #define PARALLAX_TEXTURE_INSTANCING_GLCORE
++//  before building the macOS shader bundle, so its OpenGL variants read instance data from a texture.
++//  Leave it empty for Windows and Linux bundles, where OpenGL supports structured buffers.
++//
+diff --git a/Assets/Shaders/Scatters/InstancingShaders/ParallaxScatterStructs.cginc b/Assets/Shaders/Scatters/InstancingShaders/ParallaxScatterStructs.cginc
+index c55fa7e..0f0b341 100644
+--- a/Assets/Shaders/Scatters/InstancingShaders/ParallaxScatterStructs.cginc
++++ b/Assets/Shaders/Scatters/InstancingShaders/ParallaxScatterStructs.cginc
+@@ -3,10 +3,38 @@
+ //  Contains definitions for input/output structs and instancing data
+ //
+ 
++// Defines PARALLAX_TEXTURE_INSTANCING_GLCORE when building the macOS shader bundle
++#include "ParallaxScatterPlatform.cginc"
++
+ // Instancing data
++#if defined (SHADER_API_GLCORE) && defined (PARALLAX_TEXTURE_INSTANCING_GLCORE)
++
++// macOS OpenGL 4.1 has no structured buffers. Scatters are evaluated on the CPU (CpuScatterSystem) and the
++// transforms are uploaded to a float texture instead - 4 texels per instance, one per matrix row, 256 instances per row
++#define PARALLAX_TEXTURE_INSTANCING
++
++#define DECLARE_INSTANCING_DATA                                                     \
++    Texture2D<float4> _InstanceDataTex;                                             \
++    TransformData LoadInstanceData(uint instanceID)                                 \
++    {                                                                               \
++        int x = (int)(instanceID & 255u) * 4;                                       \
++        int y = (int)(instanceID >> 8);                                             \
++        TransformData data;                                                         \
++        data.objectToWorld = float4x4(                                              \
++            _InstanceDataTex.Load(int3(x, y, 0)),                                   \
++            _InstanceDataTex.Load(int3(x + 1, y, 0)),                               \
++            _InstanceDataTex.Load(int3(x + 2, y, 0)),                               \
++            _InstanceDataTex.Load(int3(x + 3, y, 0)));                              \
++        return data;                                                                \
++    }
++
++#else
++
+ #define DECLARE_INSTANCING_DATA                 \
+     StructuredBuffer<TransformData> _InstanceData;
+ 
++#endif
++
+ // Unity doesn't pass reflection probe data to instanced shaders
+ // So we'll approximate it with a fresnel colour instead
+ #define DONT_SAMPLE_REFLECTIONS
+diff --git a/Assets/Shaders/Scatters/InstancingShaders/ParallaxScatterUtils.cginc b/Assets/Shaders/Scatters/InstancingShaders/ParallaxScatterUtils.cginc
+index 8579b54..5c1329f 100644
+--- a/Assets/Shaders/Scatters/InstancingShaders/ParallaxScatterUtils.cginc
++++ b/Assets/Shaders/Scatters/InstancingShaders/ParallaxScatterUtils.cginc
+@@ -1,4 +1,8 @@
+-﻿#define INSTANCE_DATA _InstanceData[instanceID]
++﻿#if defined (PARALLAX_TEXTURE_INSTANCING)
++    #define INSTANCE_DATA LoadInstanceData(instanceID)
++#else
++    #define INSTANCE_DATA _InstanceData[instanceID]
++#endif
+ 
+ // The object to world transformation matrix (TRS matrix) uses every matrix value except for the first 3 values in the last row
+ // This row stores the colour of the terrain at this scatter position

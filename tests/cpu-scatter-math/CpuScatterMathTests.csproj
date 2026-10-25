@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Checks the CPU scatter backend's maths against a literal port of the shader code.
+    Run with tests/run-tests.sh, which passes:
+      ParallaxSource      - the patched "Mod Source/Parallax" folder (build/upstream after scripts/build-mac.sh)
+      UnityMathematicsDll - Unity.Mathematics.dll, as shipped with KSP Burst
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <RollForward>Major</RollForward>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="$(ParallaxSource)/Scatter System/CPU/CpuScatterMath.cs" />
+    <Reference Include="Unity.Mathematics">
+      <HintPath>$(UnityMathematicsDll)</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>
